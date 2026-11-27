@@ -8,7 +8,7 @@ main{max-width:900px;margin:auto}h1{font-size:24px;margin:0 0 20px}.item{padding
 button{background:#252d3d;color:#f3f4fa;border:0;border-radius:6px;padding:7px 12px;margin:10px 8px 0 0;cursor:pointer}.empty{color:#a6aec0}
 </style><main><h1>Загрузки</h1><section id="items" class="empty">Загрузок пока нет</section></main>
 <script>
-function render(items){const root=document.getElementById('items');root.className=items.length?'':'empty';root.innerHTML=items.length?items.map(x=>`<article class="item"><div class="name">${esc(x.name)}</div><div class="meta">${esc(x.size)} · ${esc(x.status)}</div><progress max="100" value="${x.progress}"></progress><div>${x.complete?`<button onclick="act('open',${x.id})">Открыть файл</button>`:x.active?`<button onclick="act('cancel',${x.id})">Отменить</button>`:''}</div></article>`).join(''):'Загрузок пока нет';}
+function render(items){const root=document.getElementById('items');root.className=items.length?'':'empty';root.innerHTML=items.length?items.map(x=>`<article class="item"><div class="name">${esc(x.name)}</div><div class="meta">${esc(x.size)} · ${esc(x.status)}</div><progress max="100" value="${Number.isFinite(x.progress)?Math.max(0,Math.min(100,x.progress)):0}"></progress><div>${x.complete?`<button onclick="act('open','${esc(x.id)}')">Открыть файл</button>`:x.active?`<button onclick="act('cancel','${esc(x.id)}')">Отменить</button>`:''}</div></article>`).join(''):'Загрузок пока нет';}
 function esc(v){return String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function act(op,id){CefSharp.PostMessage(`download:${op}:${id}`)}
 </script></html>

@@ -18,8 +18,21 @@ public partial class App : Application
             "Blatmetro",
             "Browser");
 
-        Directory.CreateDirectory(appData);
-        Directory.CreateDirectory(Path.Combine(appData, "Cache"));
+        try
+        {
+            Directory.CreateDirectory(appData);
+            Directory.CreateDirectory(Path.Combine(appData, "Cache"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            MessageBox.Show(
+                $"Не удалось создать папку данных браузера: {ex.Message}",
+                "Blatmetro Browser",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            Shutdown(-1);
+            return;
+        }
 
         var subprocessPath = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(subprocessPath))
@@ -38,7 +51,7 @@ public partial class App : Application
             CachePath = Path.Combine(appData, "Cache"),
             BrowserSubprocessPath = subprocessPath,
             LogFile = Path.Combine(appData, "cef.log"),
-            LogSeverity = LogSeverity.Verbose,
+            LogSeverity = LogSeverity.Warning,
             Locale = "ru"
         };
 
@@ -52,9 +65,6 @@ public partial class App : Application
 
         // Work around Chromium's auto-de-elevation early exit on affected Windows/CEF builds.
         settings.CefCommandLineArgs.Add("do-not-de-elevate", string.Empty);
-
-        // Diagnostic fallback for older GPUs/drivers. This can disable WebGL and GPU rendering.
-        settings.CefCommandLineArgs.Add("disable-gpu", string.Empty);
 
         try
         {

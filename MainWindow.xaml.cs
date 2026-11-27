@@ -5,8 +5,11 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using System.Diagnostics;
 using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security;
 using Microsoft.Win32;
 using CefSharp;
 using CefSharp.DevTools.Emulation;
@@ -39,14 +42,22 @@ public partial class MainWindow : Window
         "Browser");
     private readonly string _bookmarksFile;
     private readonly string _settingsFile;
+    private readonly string _downloadsFile;
     private readonly List<SearchEngineOption> _searchEngineOptions;
     private string _selectedSearchEngine = DefaultSearchEngine;
     private string _selectedTheme = "System";
     private bool _loadingSettings;
     private List<Bookmark> _bookmarks = [];
     private BrowserTab? _activeTab;
-    private readonly Dictionary<int, DownloadEntry> _downloads = [];
+    private readonly Dictionary<int, DownloadEntry> _downloadsByCefId = [];
+    private readonly List<DownloadEntry> _downloadEntries = [];
+    private readonly DispatcherTimer _downloadRefreshTimer = new()
+    {
+        Interval = TimeSpan.FromMilliseconds(250)
+    };
+    private GridLength[]? _previousRowHeights;
     private bool _isFullscreen;
+    private bool _downloadStorageWarningShown;
     private WindowStyle _previousWindowStyle;
     private ResizeMode _previousResizeMode;
     private WindowState _previousWindowState;
@@ -68,8 +79,15 @@ public partial class MainWindow : Window
         Directory.CreateDirectory(_appDataDirectory);
         _bookmarksFile = Path.Combine(_appDataDirectory, "bookmarks.json");
         _settingsFile = Path.Combine(_appDataDirectory, "settings.json");
+        _downloadsFile = Path.Combine(_appDataDirectory, "downloads.json");
         LoadBookmarks();
         LoadSettings();
+        LoadDownloadHistory();
+        _downloadRefreshTimer.Tick += (_, _) =>
+        {
+            _downloadRefreshTimer.Stop();
+            RenderDownloads();
+        };
         _searchEngineOptions = CreateSearchEngineOptions();
         _loadingSettings = true;
         SearchEngineBox.ItemsSource = _searchEngineOptions;
@@ -320,11 +338,28 @@ public partial class MainWindow : Window
         // built-in PostMessage bridge. This avoids async JS-object binding races.
         browser.JavascriptMessageReceived += (_, args) =>
         {
-            var query = args.Message?.ToString();
-            if (!string.IsNullOrWhiteSpace(query))
+            var frame = args.Frame;
+            if (frame is null || !frame.IsMain ||
+                !TryGetTrustedPage(frame.Url, out var source) ||
+                args.Message is not string message ||
+                string.IsNullOrWhiteSpace(message) || message.Length > 2048)
             {
-                Dispatcher.BeginInvoke(() => HandlePageMessage(query));
+                return;
             }
+
+            var sourceUrl = frame.Url;
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+            try
+            {
+                _ = Dispatcher.BeginInvoke(() =>
+                {
+                    // Navigation may have changed while the message was queued.
+                    if (!_tabs.Any(tab => ReferenceEquals(tab.Browser, browser)) ||
+                        !IsTrustedPage(browser.Address, source) || !IsSameLocalPage(sourceUrl, source)) return;
+                    HandlePageMessage(message, source);
+                });
+            }
+            catch (InvalidOperationException) { }
         };
 
         var title = new TextBlock
@@ -378,25 +413,57 @@ public partial class MainWindow : Window
         header.MouseLeftButtonUp += (_, _) => SelectTab(tab);
         closeButton.Click += (_, _) => CloseTab(tab);
 
-        browser.AddressChanged += (_, _) => Dispatcher.BeginInvoke(() =>
+        browser.AddressChanged += (_, _) =>
         {
-            if (_activeTab == tab)
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+            try
             {
-                var currentAddress = browser.Address;
-                AddressBox.Text = IsNewTabAddress(currentAddress) ? string.Empty : currentAddress;
-                UpdateSecurityIndicator(currentAddress);
-                UpdateBookmarkButton();
+                _ = Dispatcher.BeginInvoke(() =>
+                {
+                    if (_activeTab == tab)
+                    {
+                        var currentAddress = browser.Address;
+                        AddressBox.Text = IsNewTabAddress(currentAddress) ? string.Empty : currentAddress;
+                        UpdateSecurityIndicator(currentAddress);
+                        UpdateBookmarkButton();
+                    }
+                });
             }
-        });
+            catch (InvalidOperationException) { }
+        };
 
-        browser.TitleChanged += (_, _) => Dispatcher.BeginInvoke(() =>
+        browser.TitleChanged += (_, _) =>
         {
-            var currentTitle = browser.Title;
-            var pageTitle = string.IsNullOrWhiteSpace(currentTitle) ? "Новая вкладка" : currentTitle;
-            tab.Title.Text = pageTitle.Length > 24 ? pageTitle[..24] + "…" : pageTitle;
-        });
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+            try
+            {
+                _ = Dispatcher.BeginInvoke(() =>
+                {
+                    var currentTitle = browser.Title;
+                    var pageTitle = string.IsNullOrWhiteSpace(currentTitle) ? "Новая вкладка" : currentTitle;
+                    tab.Title.Text = pageTitle.Length > 24 ? pageTitle[..24] + "…" : pageTitle;
+                });
+            }
+            catch (InvalidOperationException) { }
+        };
 
-        browser.LoadingStateChanged += (_, _) => Dispatcher.BeginInvoke(UpdateNavigationButtons);
+        browser.LoadingStateChanged += (_, _) =>
+        {
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+            try
+            {
+                _ = Dispatcher.BeginInvoke(() =>
+                {
+                    UpdateNavigationButtons();
+                    var currentTab = _tabs.FirstOrDefault(item => ReferenceEquals(item.Browser, browser));
+                    if (currentTab?.IsDownloadsTab == true && !browser.IsLoading)
+                    {
+                        RenderDownloads(currentTab);
+                    }
+                });
+            }
+            catch (InvalidOperationException) { }
+        };
 
         SelectTab(tab);
         browser.Address = string.IsNullOrWhiteSpace(initialAddress)
@@ -404,20 +471,151 @@ public partial class MainWindow : Window
             : initialAddress;
     }
 
-    private void HandlePageMessage(string message)
+    private enum TrustedLocalPage
     {
-        if (message.StartsWith("download:cancel:", StringComparison.Ordinal) && int.TryParse(message[16..], out var cancelId))
+        NewTab,
+        Downloads
+    }
+
+    private static bool TryGetTrustedPage(string? address, out TrustedLocalPage page)
+    {
+        if (IsSameLocalPage(address, TrustedLocalPage.NewTab))
         {
-            if (_downloads.TryGetValue(cancelId, out var download)) download.Callback?.Cancel();
+            page = TrustedLocalPage.NewTab;
+            return true;
+        }
+        if (IsSameLocalPage(address, TrustedLocalPage.Downloads))
+        {
+            page = TrustedLocalPage.Downloads;
+            return true;
+        }
+        page = default;
+        return false;
+    }
+
+    private static bool IsTrustedPage(string? address, TrustedLocalPage page) =>
+        IsSameLocalPage(address, page);
+
+    private static bool IsSameLocalPage(string? address, TrustedLocalPage page)
+    {
+        if (!Uri.TryCreate(address, UriKind.Absolute, out var uri) || !uri.IsFile) return false;
+        var fileName = page == TrustedLocalPage.NewTab ? "NewTab.html" : "Downloads.html";
+        var trustedPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "Assets", fileName));
+        try
+        {
+            return string.Equals(Path.GetFullPath(uri.LocalPath), trustedPath,
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetDownloadPath(string path, out string fullPath)
+    {
+        fullPath = string.Empty;
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        try
+        {
+            var root = Path.GetFullPath(GetDownloadsDirectory()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                + Path.DirectorySeparatorChar;
+            var candidate = Path.GetFullPath(path);
+            if (!candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return false;
+            fullPath = candidate;
+            return true;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static string GetDownloadsDirectory()
+    {
+        var downloadsFolderId = new Guid("374DE290-123F-4565-9164-39C4925E467B");
+        IntPtr pathPointer = IntPtr.Zero;
+        try
+        {
+            if (SHGetKnownFolderPath(ref downloadsFolderId, 0, IntPtr.Zero, out pathPointer) == 0)
+            {
+                var path = Marshal.PtrToStringUni(pathPointer);
+                if (!string.IsNullOrWhiteSpace(path)) return path;
+            }
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+            Debug.WriteLine($"Unable to resolve the Windows Downloads known folder: {ex.Message}");
+        }
+        finally
+        {
+            if (pathPointer != IntPtr.Zero) Marshal.FreeCoTaskMem(pathPointer);
+        }
+
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SHGetKnownFolderPath(ref Guid folderId, uint flags, IntPtr token, out IntPtr path);
+
+    private static string SanitizeDownloadName(string? suggestedName, int downloadId)
+    {
+        var name = Path.GetFileName(suggestedName ?? string.Empty);
+        var invalidChars = Path.GetInvalidFileNameChars();
+        name = new string(name.Where(character => !invalidChars.Contains(character)).ToArray()).Trim().TrimEnd('.');
+        return string.IsNullOrWhiteSpace(name) ? $"download-{downloadId}" : name;
+    }
+
+    private static string GetUniqueDownloadPath(string directory, string name)
+    {
+        var candidate = Path.Combine(directory, name);
+        if (!File.Exists(candidate) && !Directory.Exists(candidate)) return candidate;
+
+        var stem = Path.GetFileNameWithoutExtension(name);
+        var extension = Path.GetExtension(name);
+        for (var suffix = 1; suffix < 100_000; suffix++)
+        {
+            candidate = Path.Combine(directory, $"{stem} ({suffix}){extension}");
+            if (!File.Exists(candidate) && !Directory.Exists(candidate)) return candidate;
+        }
+        throw new IOException("Не удалось подобрать свободное имя для файла загрузки.");
+    }
+
+    private void HandlePageMessage(string message, TrustedLocalPage source)
+    {
+        if (source == TrustedLocalPage.NewTab)
+        {
+            Navigate(message.Trim());
             return;
         }
-        if (message.StartsWith("download:open:", StringComparison.Ordinal) && int.TryParse(message[14..], out var openId))
+        if (source != TrustedLocalPage.Downloads) return;
+
+        var parts = message.Split(':');
+        if (parts.Length != 3 || parts[0] != "download" ||
+            !Guid.TryParseExact(parts[2], "D", out var key)) return;
+
+        var download = _downloadEntries.FirstOrDefault(item => item.Key == key);
+        if (download is null) return;
+        if (parts[1] == "cancel")
         {
-            if (_downloads.TryGetValue(openId, out var download) && download.Complete && File.Exists(download.Path))
-                Process.Start(new ProcessStartInfo(download.Path) { UseShellExecute = true });
+            if (download.InProgress) download.Callback?.Cancel();
             return;
         }
-        Navigate(message);
+        if (parts[1] == "open" && download.Complete)
+        {
+            if (TryGetDownloadPath(download.Path, out var safePath) && File.Exists(safePath))
+            {
+                try
+                {
+                    Process.Start(new ProcessStartInfo(safePath) { UseShellExecute = true });
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
+                {
+                    MessageBox.Show($"Не удалось открыть файл: {ex.Message}", "Blatmetro Browser",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+            }
+        }
     }
 
     private bool IsNewTabAddress(string? address)
@@ -604,43 +802,20 @@ public partial class MainWindow : Window
 
     private void LoadSettings()
     {
-        try
-        {
-            if (!File.Exists(_settingsFile))
-            {
-                return;
-            }
-
-            var settings = JsonSerializer.Deserialize<BrowserSettings>(File.ReadAllText(_settingsFile));
-            if (settings?.SearchEngine is string engine && SearchEngines.ContainsKey(engine))
-            {
-                _selectedSearchEngine = engine;
-            }
-
-            if (settings?.Theme is string theme && IsValidThemeMode(theme))
-            {
-                _selectedTheme = theme;
-            }
-        }
-        catch (IOException)
-        {
-            _selectedSearchEngine = DefaultSearchEngine;
-        }
-        catch (JsonException)
-        {
-            _selectedSearchEngine = DefaultSearchEngine;
-        }
+        var settings = ReadJson<BrowserSettings>(_settingsFile);
+        if (settings?.SearchEngine is string engine && SearchEngines.ContainsKey(engine))
+            _selectedSearchEngine = engine;
+        if (settings?.Theme is string theme && IsValidThemeMode(theme))
+            _selectedTheme = theme;
     }
 
     private void SaveSettings()
     {
         try
         {
-            var json = JsonSerializer.Serialize(new BrowserSettings(_selectedSearchEngine, _selectedTheme),
-                new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(_settingsFile, json);
+            WriteJsonAtomically(_settingsFile, new BrowserSettings(_selectedSearchEngine, _selectedTheme));
         }
-        catch (IOException ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
         {
             MessageBox.Show($"Не удалось сохранить настройки: {ex.Message}", "Blatmetro Browser",
                 MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -649,31 +824,19 @@ public partial class MainWindow : Window
 
     private void LoadBookmarks()
     {
-        try
-        {
-            if (File.Exists(_bookmarksFile))
-            {
-                _bookmarks = JsonSerializer.Deserialize<List<Bookmark>>(File.ReadAllText(_bookmarksFile)) ?? [];
-            }
-        }
-        catch (IOException)
-        {
-            _bookmarks = [];
-        }
-        catch (JsonException)
-        {
-            _bookmarks = [];
-        }
+        _bookmarks = (ReadJson<List<Bookmark>>(_bookmarksFile) ?? [])
+            .Where(item => item is not null && !string.IsNullOrWhiteSpace(item.Url) &&
+                           !string.IsNullOrWhiteSpace(item.Title))
+            .ToList();
     }
 
     private void SaveBookmarks()
     {
         try
         {
-            var json = JsonSerializer.Serialize(_bookmarks, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(_bookmarksFile, json);
+            WriteJsonAtomically(_bookmarksFile, _bookmarks);
         }
-        catch (IOException ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
         {
             MessageBox.Show($"Не удалось сохранить закладки: {ex.Message}", "Blatmetro Browser",
                 MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -780,6 +943,121 @@ public partial class MainWindow : Window
         }
     }
 
+    private void LoadDownloadHistory()
+    {
+        var records = ReadJson<List<DownloadRecord>>(_downloadsFile) ?? [];
+        var recoveredInterrupted = false;
+        foreach (var record in records)
+        {
+            if (record is null || record.Key == Guid.Empty) continue;
+            var entry = new DownloadEntry(record);
+            if (entry.InProgress)
+            {
+                entry.InProgress = false;
+                entry.Callback = null;
+                entry.Status = "Прервано при закрытии браузера";
+                recoveredInterrupted = true;
+            }
+            if (entry.Complete && !File.Exists(entry.Path))
+            {
+                entry.Complete = false;
+                entry.Status = "Файл отсутствует";
+            }
+            _downloadEntries.Add(entry);
+        }
+        if (recoveredInterrupted) SaveDownloadHistory();
+    }
+
+    private void SaveDownloadHistory()
+    {
+        try
+        {
+            var records = _downloadEntries.Select(item => new DownloadRecord(
+                item.Key, item.Name, item.Path, item.Status, item.Received, item.Total,
+                item.Progress, item.Complete, item.InProgress, item.CreatedAt, item.UpdatedAt)).ToList();
+            WriteJsonAtomically(_downloadsFile, records);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            Debug.WriteLine($"Unable to save download history: {ex.Message}");
+            if (!_downloadStorageWarningShown)
+            {
+                _downloadStorageWarningShown = true;
+                MessageBox.Show($"Не удалось сохранить историю загрузок: {ex.Message}", "Blatmetro Browser",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+    }
+
+    private static T? ReadJson<T>(string path) where T : class
+    {
+        foreach (var candidate in new[] { path, path + ".bak" })
+        {
+            try
+            {
+                if (File.Exists(candidate))
+                {
+                    var value = JsonSerializer.Deserialize<T>(File.ReadAllText(candidate));
+                    if (value is not null) return value;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException or JsonException)
+            {
+                Debug.WriteLine($"Unable to read {candidate}: {ex.Message}");
+            }
+        }
+        return null;
+    }
+
+    private static bool IsValidJsonFile<T>(string path) where T : class
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<T>(File.ReadAllText(path)) is not null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException or JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static void WriteJsonAtomically<T>(string path, T value) where T : class
+    {
+        var directory = Path.GetDirectoryName(path)!;
+        Directory.CreateDirectory(directory);
+        var tempPath = Path.Combine(directory, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
+        var backupPath = path + ".bak";
+        try
+        {
+            using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(stream, value, new JsonSerializerOptions { WriteIndented = true });
+                stream.Flush(flushToDisk: true);
+            }
+
+            if (File.Exists(path))
+            {
+                if (IsValidJsonFile<T>(path)) File.Copy(path, backupPath, overwrite: true);
+                File.Replace(tempPath, path, destinationBackupFileName: null, ignoreMetadataErrors: true);
+            }
+            else
+            {
+                File.Move(tempPath, path);
+            }
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempPath)) File.Delete(tempPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+            {
+                Debug.WriteLine($"Unable to remove temporary JSON file {tempPath}: {ex.Message}");
+            }
+        }
+    }
+
     private void Downloads_Click(object sender, RoutedEventArgs e)
     {
         CloseMainMenu();
@@ -802,7 +1080,7 @@ public partial class MainWindow : Window
         foreach (var tab in onlyTab is null ? _tabs.Where(t => t.IsDownloadsTab) : [onlyTab])
         {
             if (!tab.Browser.IsBrowserInitialized || tab.Browser.IsLoading) continue;
-            var json = JsonSerializer.Serialize(_downloads.Values.OrderByDescending(d => d.Id).Select(d => new { d.Id, name=d.Name, size=$"{FormatBytes(d.Received)} / {FormatBytes(d.Total)}", status=d.Status, progress=d.Progress, complete=d.Complete && File.Exists(d.Path), active=d.InProgress }));
+            var json = JsonSerializer.Serialize(_downloadEntries.OrderByDescending(d => d.CreatedAt).Select(d => new { id=d.Key, name=d.Name, size=$"{FormatBytes(d.Received)} / {FormatBytes(d.Total)}", status=d.Status, progress=d.Progress, complete=d.Complete && File.Exists(d.Path), active=d.InProgress }));
             tab.Browser.ExecuteScriptAsync($"render({json});");
         }
     }
@@ -811,26 +1089,83 @@ public partial class MainWindow : Window
 
     private void UpdateDownload(DownloadItem downloadItem, IDownloadItemCallback callback)
     {
-        Dispatcher.BeginInvoke(() =>
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+        try
         {
-            if (!_downloads.TryGetValue(downloadItem.Id, out var item))
-                _downloads[downloadItem.Id] = item = new DownloadEntry(downloadItem.Id);
-            item.Name = downloadItem.SuggestedFileName;
-            item.Path = downloadItem.FullPath;
-            item.Received = downloadItem.ReceivedBytes;
-            item.Total = downloadItem.TotalBytes;
-            item.Progress = downloadItem.PercentComplete;
-            item.Complete = downloadItem.IsComplete;
-            item.InProgress = downloadItem.IsInProgress;
-            item.Callback = callback;
-            item.Status = downloadItem.IsComplete ? "Завершено" : downloadItem.IsInProgress ? "Загрузка" : "Прервано или ошибка";
-            RenderDownloads();
-        });
+            _ = Dispatcher.BeginInvoke(() =>
+            {
+                var isNew = false;
+                if (!_downloadsByCefId.TryGetValue(downloadItem.Id, out var item))
+                {
+                    item = new DownloadEntry(downloadItem.Id);
+                    _downloadsByCefId[downloadItem.Id] = item;
+                    _downloadEntries.Add(item);
+                    isNew = true;
+                }
+                item.Name = Path.GetFileName(downloadItem.SuggestedFileName ?? string.Empty);
+                if (string.IsNullOrWhiteSpace(item.Name)) item.Name = "Загрузка";
+                item.Path = downloadItem.FullPath ?? string.Empty;
+                item.Received = downloadItem.ReceivedBytes;
+                item.Total = downloadItem.TotalBytes;
+                item.Progress = downloadItem.PercentComplete < 0 && downloadItem.TotalBytes > 0
+                    ? (int)Math.Clamp(downloadItem.ReceivedBytes * 100d / downloadItem.TotalBytes, 0, 100)
+                    : Math.Clamp(downloadItem.PercentComplete, 0, 100);
+                item.Complete = downloadItem.IsComplete;
+                item.InProgress = downloadItem.IsInProgress;
+                item.Callback = callback;
+                item.Status = downloadItem.IsComplete ? "Завершено" : downloadItem.IsCancelled
+                    ? "Отменено или прервано" : downloadItem.IsInProgress ? "Загрузка" : "Ошибка загрузки";
+                item.UpdatedAt = DateTimeOffset.Now;
+                if (isNew || !item.InProgress) SaveDownloadHistory();
+                ScheduleDownloadRefresh(item.InProgress);
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            // The window may be closing while CEF reports a final download update.
+        }
     }
 
-    private sealed class DownloadEntry(int id)
+    private void ScheduleDownloadRefresh(bool isProgressUpdate)
     {
-        public int Id { get; } = id;
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+        if (!isProgressUpdate)
+        {
+            _downloadRefreshTimer.Stop();
+            RenderDownloads();
+        }
+        else if (!_downloadRefreshTimer.IsEnabled)
+        {
+            _downloadRefreshTimer.Start();
+        }
+    }
+
+    private sealed class DownloadEntry
+    {
+        public DownloadEntry(int cefId)
+        {
+            CefId = cefId;
+            Key = Guid.NewGuid();
+        }
+
+        public DownloadEntry(DownloadRecord record)
+        {
+            Key = record.Key;
+            CefId = -1;
+            Name = string.IsNullOrWhiteSpace(record.Name) ? "Загрузка" : record.Name;
+            Path = record.Path ?? string.Empty;
+            Status = string.IsNullOrWhiteSpace(record.Status) ? "Неизвестный статус" : record.Status;
+            Received = Math.Max(0, record.Received);
+            Total = record.Total;
+            Progress = Math.Clamp(record.Progress, 0, 100);
+            Complete = record.Complete;
+            InProgress = record.InProgress;
+            CreatedAt = record.CreatedAt == default ? record.UpdatedAt : record.CreatedAt;
+            UpdatedAt = record.UpdatedAt;
+        }
+
+        public Guid Key { get; }
+        public int CefId { get; }
         public string Name { get; set; } = "Загрузка";
         public string Path { get; set; } = "";
         public string Status { get; set; } = "Подготовка";
@@ -840,7 +1175,13 @@ public partial class MainWindow : Window
         public bool Complete { get; set; }
         public bool InProgress { get; set; }
         public IDownloadItemCallback? Callback { get; set; }
+        public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.Now;
+        public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.Now;
     }
+
+    private sealed record DownloadRecord(Guid Key, string Name, string Path, string Status,
+        long Received, long Total, int Progress, bool Complete, bool InProgress,
+        DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
 
     private sealed class BrowserDownloadHandler(MainWindow owner) : CefSharp.Handler.DownloadHandler
     {
@@ -848,10 +1189,29 @@ public partial class MainWindow : Window
         {
             if (!callback.IsDisposed)
             {
-                var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
-                Directory.CreateDirectory(directory);
-                var name = Path.GetFileName(downloadItem.SuggestedFileName);
-                callback.Continue(Path.Combine(directory, string.IsNullOrWhiteSpace(name) ? $"download-{downloadItem.Id}" : name), false);
+                try
+                {
+                    var directory = GetDownloadsDirectory();
+                    Directory.CreateDirectory(directory);
+                    var name = SanitizeDownloadName(downloadItem.SuggestedFileName, downloadItem.Id);
+                    callback.Continue(GetUniqueDownloadPath(directory, name), showDialog: false);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException or ArgumentException)
+                {
+                    Debug.WriteLine($"Unable to prepare download destination: {ex.Message}");
+                    var fallback = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+                    try
+                    {
+                        Directory.CreateDirectory(fallback);
+                        callback.Continue(GetUniqueDownloadPath(fallback,
+                            SanitizeDownloadName(downloadItem.SuggestedFileName, downloadItem.Id)), showDialog: false);
+                    }
+                    catch (Exception fallbackException) when (fallbackException is IOException or UnauthorizedAccessException or SecurityException or ArgumentException)
+                    {
+                        Debug.WriteLine($"Unable to use fallback download destination: {fallbackException.Message}");
+                        return false;
+                    }
+                }
             }
             return true;
         }
@@ -871,7 +1231,11 @@ public partial class MainWindow : Window
                           uri.Scheme is "http" or "https" or "about"
                 ? targetUrl
                 : "about:blank";
-            owner.Dispatcher.BeginInvoke(() => owner.AddTab(address));
+            if (!owner.Dispatcher.HasShutdownStarted && !owner.Dispatcher.HasShutdownFinished)
+            {
+                try { _ = owner.Dispatcher.BeginInvoke(() => owner.AddTab(address)); }
+                catch (InvalidOperationException) { }
+            }
             return true;
         }
     }
@@ -948,6 +1312,7 @@ public partial class MainWindow : Window
 
         _isFullscreen = true;
         var rows = ((Grid)Content).RowDefinitions;
+        _previousRowHeights = rows.Take(3).Select(row => row.Height).ToArray();
         rows[0].Height = new GridLength(0);
         rows[1].Height = new GridLength(0);
         rows[2].Height = new GridLength(0);
@@ -973,9 +1338,11 @@ public partial class MainWindow : Window
         WindowStyle = _previousWindowStyle;
         ResizeMode = _previousResizeMode;
         var rows = ((Grid)Content).RowDefinitions;
-        rows[0].Height = new GridLength(46);
-        rows[1].Height = new GridLength(58);
-        rows[2].Height = new GridLength(34);
+        if (_previousRowHeights is { Length: >= 3 } previousRows)
+        {
+            for (var index = 0; index < 3; index++) rows[index].Height = previousRows[index];
+        }
+        _previousRowHeights = null;
         WindowState = _previousWindowState;
 
         _isFullscreen = false;
@@ -1077,6 +1444,8 @@ public partial class MainWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
+        _downloadRefreshTimer.Stop();
+        SaveDownloadHistory();
 
         foreach (var tab in _tabs.ToArray())
         {

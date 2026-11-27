@@ -12,7 +12,7 @@
     <StartupObject>BlatmetroBrowser.Program</StartupObject>
     <AssemblyName>BlatmetroBrowser</AssemblyName>
     <RootNamespace>BlatmetroBrowser</RootNamespace>
-    <Version>0.4.6</Version>
+    <Version>0.4.7</Version>
     <Product>Blatmetro Browser</Product>
     <Company>Blatmetro</Company>
     <Description>Chromium-based browser for BlatmetroOS development.</Description>
